@@ -13,6 +13,10 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 @Service
 @RequiredArgsConstructor
@@ -22,6 +26,13 @@ public class PointServiceImpl implements PointService {
 
     private final UserPointTable userPointRepository;
     private final PointHistoryTable pointHistoryRepository;
+
+    private final ConcurrentHashMap<String, Lock> userLockMap = new ConcurrentHashMap<>();
+
+    private Lock getUserLock(long userid) {
+
+        return userLockMap.computeIfAbsent(String.valueOf(userid), id -> new ReentrantLock());
+    }
 
     @Override
     public UserPoint selectById(long id) {
@@ -41,7 +52,7 @@ public class PointServiceImpl implements PointService {
     public UserPoint charge(long id, long chargeAmount) {
 
         validateId(id);
-        return pointTransaction(id, chargeAmount, TransactionType.CHARGE);
+        return executePointTransactionWithUserLock(id, chargeAmount, TransactionType.CHARGE);
     }
 
     @Override
@@ -49,7 +60,7 @@ public class PointServiceImpl implements PointService {
 
         validateId(id);
         getCurrentPointOrThrow(id);
-        return pointTransaction(id, useAmount, TransactionType.USE);
+        return executePointTransactionWithUserLock(id, useAmount, TransactionType.USE);
     }
 
     /**
@@ -105,6 +116,46 @@ public class PointServiceImpl implements PointService {
         pointHistoryRepository.insert(id, deltaPoint, transactionType, System.currentTimeMillis());
 
         return updatedPoint;
+    }
+
+
+    /**
+     *  포인트 트랜젝션을 실행합니다.
+     *
+     * @param id
+     * @param deltaPoint
+     * @param transactionType
+     * @return
+     */
+    private UserPoint executePointTransactionWithUserLock(long id, long deltaPoint, TransactionType transactionType) {
+
+        return executeWithUserLock(id, () -> pointTransaction(id, deltaPoint, transactionType) );
+    }
+
+    /**
+     * 유저 락을 사용하여 동시성 문제를 해결하며,
+     * 포인트 작업을 실행합니다,
+     *
+     * @param userid
+     * @param userPointSupplier
+     * @return UserPoint
+     */
+    private UserPoint executeWithUserLock(long userid, Supplier<UserPoint> userPointSupplier) {
+
+        Lock userLock = getUserLock(userid);
+        userLock.lock(); // 락을 걸고
+        log.debug("{} 사용자의 락을 걸었습니다. 시간: {}", userid, System.currentTimeMillis());
+        try {
+            return userPointSupplier.get();
+        }
+        catch (Exception e) {
+            log.error("사용자 ID {}에 대한 트랜잭션 처리 중 오류 발생: {}", userid, e.getMessage());
+            throw e;
+        }
+        finally {
+            userLock.unlock(); // 락 해제
+            log.debug("{} 사용자의 락을 해제했습니다. 시간: {}", userid, System.currentTimeMillis());
+        }
     }
 
     /**
